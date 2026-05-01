@@ -1,0 +1,6 @@
+name: astrbot_plugin_ipquery
+display_name: IP 查询
+desc: 查询 IPv4 / IPv6 / 域名归属地，返回中文格式的国家、地区、城市、ISP、ASN、时区、经纬度信息。
+version: v0.1.0
+author: AstrBot Team
+astrbot_version: ">=4.17.0"
