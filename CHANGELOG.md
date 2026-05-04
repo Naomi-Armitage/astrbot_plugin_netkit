@@ -2,6 +2,18 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 格式，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 新增
+- `/ip` 域名解析改用 **多 DoH 视角聚合** 来发现动态分配域名的多个真实节点。系统解析器 + 9 个公共 DoH 端点 (Google / AliDNS / AdGuard / DNS.SB / DNSPod / NextDNS / 360 / LibreDNS / Tiarap) 并发查询 A 与 AAAA，每端点 3s 超时，去重后传入下游展示。设计参考 [amass](https://github.com/owasp-amass/amass) 等子域枚举工具的 multi-resolver 思路。
+- 同时实现 **RFC 8427 (JSON DoH)** 和 **RFC 8484 (wire-format DoH)** 两种调用方式，纯 stdlib 手写 DNS encode/decode (`_build_dns_query` / `_parse_dns_answer` / `_skip_dns_name`)，无新依赖；解锁了只支持 wire-format 的 360 / LibreDNS / Tiarap 等端点。
+- 新增 `/iphist <域名|URL>` 命令查询 **passive DNS 历史 IP**，数据来自免费无 key 的 [AlienVault OTX](https://otx.alienvault.com/) `/api/v1/indicators/hostname/<host>/passive_dns` 端点。返回该 host 历史出现过的 A/AAAA 记录，含国家、ASN、首见 / 最近 时间戳，按 `last` 倒序最多 20 条。
+- OTX 接口对热门域名响应慢（10–25s 常见）；`_OTX_TIMEOUT_SECONDS=30` 单独配置，并通过 per-request `aiohttp.ClientTimeout` 覆盖 plugin 全局 10s session 超时。
+
+### 变更
+- `_DOH_ENDPOINTS` 由二元组 `(name, url)` 改为三元组 `(name, url, mode)`，`mode` 取 `"json"` 或 `"wire"`，`_query_doh` 按 mode 分派。
+- 已知不兼容端点 Quad9 从默认列表移除（强制 HTTP/2，aiohttp 默认 HTTP/1.1 不兼容；保留注释说明）。
+
 ## [v0.2.3] - 2026-05-04
 
 ### 修复

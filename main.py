@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import re
+import struct
 import urllib.parse
 from typing import Any
 
@@ -44,6 +45,40 @@ _ASN_WHOIS_URL = "https://stat.ripe.net/data/whois/data.json?resource=AS{asn}"
 _ASN_NETWORK_INFO_URL = "https://stat.ripe.net/data/network-info/data.json?resource={ip}"
 _ASN_INPUT_RE = re.compile(r"^(?:AS)?(\d{1,10})$", re.IGNORECASE)
 _ASN_MAX = 4_294_967_295  # 32-bit ASN upper bound
+
+# DoH (DNS-over-HTTPS) 多视角解析。地理 / 网络分散的解析器会因 EDNS Client
+# Subnet 与 anycast 选址而看到权威给出的不同"最优节点"，聚合后能发现动态分配
+# 域名（机场代理、Azure Front Door 等）真实使用的多个节点 IP。
+# 此设计参考 amass / dnsdumpster 等子域枚举工具的 multi-resolver 思路。
+#
+# 每个端点标记其支持的协议：
+#   "json" -> RFC 8427 风格（Google 首倡），URL 参数 + Accept: application/dns-json
+#   "wire" -> RFC 8484 标准（仅 wire-format DNS message 二进制，更通用）
+# 不少专业 DoH 端点（Quad9 / 360 / LibreDNS / Tiarap 等）只支持 wire；
+# 想覆盖更多视角必须实现 wire-format 调用。
+_DOH_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
+    ("Google",     "https://dns.google/resolve",                       "json"),
+    ("AliDNS",     "https://dns.alidns.com/resolve",                   "json"),
+    ("AdGuard",    "https://dns.adguard.com/resolve",                  "json"),
+    ("DNS.SB",     "https://doh.dns.sb/dns-query",                     "json"),
+    ("DNSPod",     "https://doh.pub/dns-query",                        "json"),
+    ("NextDNS",    "https://dns.nextdns.io",                           "json"),
+    ("360 (CN)",   "https://doh.360.cn/dns-query",                     "wire"),
+    ("LibreDNS",   "https://doh.libredns.gr/dns-query",                "wire"),
+    ("Tiarap",     "https://doh.tiar.app/dns-query",                   "wire"),
+    # Quad9 强制 HTTP/2，aiohttp 默认 HTTP/1.1 不兼容；省略以避免无意义请求。
+)
+_DOH_PER_ENDPOINT_TIMEOUT = 3.0  # 单端点超时，慢的解析器不拖累其他
+
+# AlienVault OTX — passive DNS 历史。免费、无需 key，按 hostname 查询会返回该
+# host 历史出现过的所有解析答案（含 first/last 时间戳）。dynamic / proxy 类
+# 子域名通常 0 records；主域 / 高流量域名能拿到几百条。
+_OTX_PDNS_URL = (
+    "https://otx.alienvault.com/api/v1/indicators/hostname/{host}/passive_dns"
+)
+# OTX 接口对高流量域名（含数百条记录）响应慢，给它独立超时；普通调用 ~1-3 秒。
+_OTX_TIMEOUT_SECONDS = 30
+_IPHIST_MAX_ROWS = 20  # /iphist 最多展示行数，防止热门域名输出爆炸
 
 
 class NetKitPlugin(Star):
@@ -101,7 +136,7 @@ class NetKitPlugin(Star):
 
         try:
             ips = await asyncio.wait_for(
-                _resolve_to_ips(host), timeout=_HTTP_TIMEOUT_SECONDS
+                _resolve_to_ips(host, self._session), timeout=_HTTP_TIMEOUT_SECONDS
             )
         except asyncio.TimeoutError:
             yield event.plain_result(f"[NetKit] DNS 解析超时: {host}")
@@ -224,6 +259,74 @@ class NetKitPlugin(Star):
         yield event.plain_result(
             _format_asn_reply(asn_number, overview, whois, source_note)
         )
+
+    @filter.command("iphist")
+    async def cmd_iphist(self, event: AstrMessageEvent, target: str = ""):
+        """查询域名/主机的 passive DNS 历史 IP。用法: /iphist <域名|URL>"""
+        raw = (target or "").strip()
+        if not raw:
+            yield event.plain_result(
+                "用法: /iphist <域名|URL>\n示例:\n"
+                "  /iphist www.cloudflare.com\n"
+                "  /iphist https://api.example.com:443\n"
+                "数据来自 AlienVault OTX 的 passive DNS 索引；"
+                "动态/短期域名通常无历史记录。"
+            )
+            return
+
+        if len(raw) > _MAX_TARGET_LEN:
+            yield event.plain_result("[NetKit] 输入无效: 超长。")
+            return
+
+        host = _extract_host(raw)
+        if not host or not _ALLOWED_TARGET_RE.match(host):
+            yield event.plain_result(
+                "[NetKit] 输入无效: 仅支持域名 / URL。"
+            )
+            return
+
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:
+            pass
+        else:
+            yield event.plain_result(
+                "[NetKit] 输入是 IP 字面量，passive DNS 仅对域名有意义。"
+            )
+            return
+
+        if self._session is None:
+            yield event.plain_result("[NetKit] 插件未就绪，请稍后再试。")
+            return
+
+        try:
+            records = await asyncio.wait_for(
+                _query_otx_passive_dns(self._session, host),
+                timeout=_OTX_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            yield event.plain_result(
+                f"[NetKit] OTX 查询超时（>{_OTX_TIMEOUT_SECONDS}s）；"
+                "热门域名记录数过多时常见，可稍后重试或换更具体的子域查询。"
+            )
+            return
+        except aiohttp.ClientError as exc:
+            logger.warning("[NetKit] OTX error for %s: %s", host, exc)
+            yield event.plain_result(f"[NetKit] 网络错误: {exc}")
+            return
+        except ValueError as exc:
+            logger.warning("[NetKit] OTX invalid JSON for %s: %s", host, exc)
+            yield event.plain_result("[NetKit] 上游返回数据无法解析。")
+            return
+
+        if not records:
+            yield event.plain_result(
+                f"[NetKit] {host} 在 AlienVault OTX 中无 A/AAAA passive DNS 记录"
+                f"（动态分配 / 短期域名常见此结果）。"
+            )
+            return
+
+        yield event.plain_result(_format_iphist_reply(host, records))
 
 
 def _reject_reserved_ip(target: str) -> str | None:
@@ -452,39 +555,216 @@ def _parse_asn_input(raw: str) -> tuple[int | None, str | None, str | None]:
     return None, host, None
 
 
-async def _resolve_to_ips(host: str) -> list[str]:
-    """Async DNS resolve ``host`` to all unique IPs (in order). IP literals
-    pass through as a single-element list.
+def _build_dns_query(host: str, rrtype: int) -> bytes:
+    """Build a minimal DNS wire-format query for ``host`` ``rrtype``.
 
-    Used by ``cmd_ip`` (展示所有解析结果) and ``_resolve_to_ip`` (反查 ASN
-    时只需第一个)。
+    Per RFC 8484, DoH transactions use ID=0 (responses must echo it; using 0
+    avoids leaking randomness across cache layers). Flags 0x0100 = standard
+    query with RD (recursion desired) set.
+    """
+    header = struct.pack("!HHHHHH", 0, 0x0100, 1, 0, 0, 0)
+    parts = host.rstrip(".").split(".")
+    qname = b"".join(
+        bytes([len(p.encode("idna"))]) + p.encode("idna") for p in parts if p
+    ) + b"\x00"
+    return header + qname + struct.pack("!HH", rrtype, 1)
+
+
+def _skip_dns_name(data: bytes, pos: int) -> int:
+    """Skip a DNS name starting at ``pos``. Returns the next byte offset, or
+    -1 if the encoding is malformed.
+    """
+    n = len(data)
+    while pos < n:
+        ln = data[pos]
+        if ln == 0:
+            return pos + 1
+        if (ln & 0xC0) == 0xC0:
+            return pos + 2  # compression pointer (2 bytes total)
+        if ln & 0xC0:
+            return -1  # reserved label-type bits set
+        pos += 1 + ln
+        if pos > n:
+            return -1
+    return -1
+
+
+def _parse_dns_answer(data: bytes, rrtype: int) -> list[str]:
+    """Extract IP strings of ``rrtype`` (1=A, 28=AAAA) from a wire-format
+    DNS response packet. Malformed bytes degrade to an empty list.
+    """
+    if len(data) < 12:
+        return []
+    ancount = struct.unpack_from("!H", data, 6)[0]
+    if ancount == 0:
+        return []
+    pos = _skip_dns_name(data, 12)
+    if pos < 0 or pos + 4 > len(data):
+        return []
+    pos += 4  # qtype + qclass
+
+    ips: list[str] = []
+    for _ in range(ancount):
+        pos = _skip_dns_name(data, pos)
+        if pos < 0 or pos + 10 > len(data):
+            break
+        rtype, rclass, _ttl, rdlen = struct.unpack_from("!HHIH", data, pos)
+        pos += 10
+        if pos + rdlen > len(data):
+            break
+        rdata = data[pos : pos + rdlen]
+        pos += rdlen
+        if rtype != rrtype or rclass != 1:
+            continue
+        try:
+            if rtype == 1 and rdlen == 4:
+                ips.append(str(ipaddress.IPv4Address(rdata)))
+            elif rtype == 28 and rdlen == 16:
+                ips.append(str(ipaddress.IPv6Address(rdata)))
+        except (ipaddress.AddressValueError, ValueError):
+            continue
+    return ips
+
+
+async def _query_doh(
+    session: aiohttp.ClientSession,
+    name: str,
+    url: str,
+    mode: str,
+    host: str,
+    rrtype: int,
+) -> list[str]:
+    """Query a single DoH endpoint for ``host`` ``rrtype``.
+
+    ``mode`` selects between ``"json"`` (RFC 8427-style, Google/Cloudflare
+    JSON DoH) and ``"wire"`` (RFC 8484, application/dns-message). Per-endpoint
+    timeout is enforced by the caller via ``asyncio.wait_for``.
+
+    Returns a list of IP strings, or an empty list on any failure.
+    """
+    try:
+        if mode == "json":
+            async with session.get(
+                url,
+                params={"name": host, "type": str(rrtype)},
+                headers={"Accept": "application/dns-json"},
+            ) as resp:
+                if resp.status != 200:
+                    return []
+                data = await resp.json(content_type=None)
+            answers = data.get("Answer") if isinstance(data, dict) else None
+            if not isinstance(answers, list):
+                return []
+            ips: list[str] = []
+            for item in answers:
+                if isinstance(item, dict) and item.get("type") == rrtype:
+                    value = item.get("data")
+                    if isinstance(value, str) and value:
+                        ips.append(value)
+            return ips
+
+        # mode == "wire": RFC 8484 binary
+        body = _build_dns_query(host, rrtype)
+        async with session.post(
+            url,
+            data=body,
+            headers={
+                "Content-Type": "application/dns-message",
+                "Accept": "application/dns-message",
+            },
+        ) as resp:
+            if resp.status != 200:
+                return []
+            packet = await resp.read()
+        return _parse_dns_answer(packet, rrtype)
+    except (asyncio.TimeoutError, aiohttp.ClientError, ValueError) as exc:
+        logger.debug("[NetKit] DoH %s (%s) failed for %s: %r", name, mode, host, exc)
+        return []
+
+
+async def _resolve_via_doh(
+    session: aiohttp.ClientSession, host: str
+) -> list[str]:
+    """Concurrently query every configured DoH endpoint for both A and AAAA,
+    each capped at ``_DOH_PER_ENDPOINT_TIMEOUT``. Returns the merged IP list.
+
+    Order is best-effort by first appearance: callers should de-duplicate
+    while preserving order if they care about presentation.
+    """
+    tasks = [
+        asyncio.wait_for(
+            _query_doh(session, name, url, mode, host, rrtype),
+            timeout=_DOH_PER_ENDPOINT_TIMEOUT,
+        )
+        for name, url, mode in _DOH_ENDPOINTS
+        for rrtype in (1, 28)  # A + AAAA
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    out: list[str] = []
+    for r in results:
+        if isinstance(r, list):
+            out.extend(r)
+    return out
+
+
+async def _resolve_to_ips(
+    host: str, session: aiohttp.ClientSession | None = None
+) -> list[str]:
+    """Resolve ``host`` to all unique IPs we can discover.
+
+    Strategy:
+      1. IP literal -> single-element list (no network).
+      2. ``loop.getaddrinfo`` for the local-resolver answer.
+      3. If a session is provided, multi-DoH aggregation runs in parallel
+         and merges with the system answer.
+
+    The DoH layer is what catches dynamic / round-robin domains where the
+    authoritative server returns a different "nearest" node per vantage
+    point (Azure Front Door, 机场代理, etc.).
     """
     try:
         ipaddress.ip_address(host)
         return [host]
     except ValueError:
         pass
+
+    seen: set[str] = set()
+    ordered: list[str] = []
+
+    def _add_many(ips: list[str]) -> None:
+        for ip in ips:
+            if not ip or ip in seen:
+                continue
+            try:
+                ipaddress.ip_address(ip)
+            except ValueError:
+                continue
+            seen.add(ip)
+            ordered.append(ip)
+
+    # 1) 系统解析器视角（受本机 DNS 服务器影响）
     loop = asyncio.get_running_loop()
     try:
         infos = await loop.getaddrinfo(host, None)
     except OSError:
-        return []
-    seen: set[str] = set()
-    ips: list[str] = []
-    for info in infos:
-        sockaddr = info[4]
-        if not sockaddr:
-            continue
-        ip = sockaddr[0]
-        if ip and ip not in seen:
-            seen.add(ip)
-            ips.append(ip)
-    return ips
+        infos = []
+    _add_many([info[4][0] for info in infos if info[4]])
+
+    # 2) DoH 多视角并发（前提：调用方传了 session）
+    if session is not None:
+        _add_many(await _resolve_via_doh(session, host))
+
+    return ordered
 
 
-async def _resolve_to_ip(host: str) -> str | None:
-    """Async DNS resolve ``host`` to its first IP. IP literals pass through."""
-    ips = await _resolve_to_ips(host)
+async def _resolve_to_ip(
+    host: str, session: aiohttp.ClientSession | None = None
+) -> str | None:
+    """Resolve ``host`` to its first IP. IP literals pass through.
+
+    Used by ``/asn`` reverse lookup where one IP is enough.
+    """
+    ips = await _resolve_to_ips(host, session)
     return ips[0] if ips else None
 
 
@@ -545,6 +825,72 @@ async def _format_extra_ips(
     return "\n".join(lines)
 
 
+async def _query_otx_passive_dns(
+    session: aiohttp.ClientSession, host: str
+) -> list[dict[str, Any]]:
+    """Fetch passive-DNS records for ``host`` from AlienVault OTX.
+
+    Returns the records filtered to A/AAAA on the exact hostname, sorted by
+    ``last`` descending (most recent first). OTX returns subdomain records
+    too; this helper drops them since /iphist is host-specific.
+
+    Bypasses the plugin-wide 10 s session timeout because OTX responses for
+    high-traffic domains routinely take 10–25 s; outer caller still bounds
+    the wait.
+    """
+    url = _OTX_PDNS_URL.format(host=urllib.parse.quote(host, safe=""))
+    request_timeout = aiohttp.ClientTimeout(total=_OTX_TIMEOUT_SECONDS)
+    async with session.get(url, timeout=request_timeout) as resp:
+        if resp.status != 200:
+            return []
+        data = await resp.json(content_type=None)
+    rows = data.get("passive_dns") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        return []
+    target = host.lower()
+    filtered: list[dict[str, Any]] = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        if (r.get("hostname") or "").lower() != target:
+            continue
+        if r.get("record_type") not in ("A", "AAAA"):
+            continue
+        if not r.get("address"):
+            continue
+        filtered.append(r)
+    filtered.sort(key=lambda r: r.get("last") or "", reverse=True)
+    return filtered
+
+
+def _format_iphist_reply(host: str, records: list[dict[str, Any]]) -> str:
+    """Render OTX passive-DNS records as a multi-line summary."""
+    shown = records[:_IPHIST_MAX_ROWS]
+    truncated = len(records) - len(shown)
+    lines = [
+        f"DNS 历史 — {host}",
+        "数据源: AlienVault OTX (passive DNS)",
+        f"共 {len(records)} 条 A/AAAA 记录" + (
+            f"，仅显示最近 {len(shown)} 条" if truncated > 0 else ""
+        ),
+        "",
+    ]
+    for r in shown:
+        addr = r.get("address") or "-"
+        first = (r.get("first") or "")[:10] or "-"
+        last = (r.get("last") or "")[:10] or "-"
+        country = r.get("flag_title") or "-"
+        asn = r.get("asn") or "-"
+        lines.append(
+            f"  {addr}\n"
+            f"    {country} | {asn}\n"
+            f"    首见 {first}, 最近 {last}"
+        )
+    if truncated > 0:
+        lines.append(f"\n... 另有 {truncated} 条更早记录未显示")
+    return "\n".join(lines)
+
+
 async def _lookup_asn_for_ip(
     session: aiohttp.ClientSession, ip: str
 ) -> int | None:
@@ -577,7 +923,7 @@ async def _resolve_host_to_asn(
     """
     try:
         ip = await asyncio.wait_for(
-            _resolve_to_ip(host), timeout=_HTTP_TIMEOUT_SECONDS
+            _resolve_to_ip(host, session), timeout=_HTTP_TIMEOUT_SECONDS
         )
     except asyncio.TimeoutError:
         return None, None, f"[NetKit] DNS 解析超时: {host}"
