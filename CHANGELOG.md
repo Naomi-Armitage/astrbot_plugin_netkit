@@ -2,6 +2,20 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 格式，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v0.2.2] - 2026-05-04
+
+### 新增
+- `/asn` 接受 IP / 域名 / URL 输入，自动反查关联 ASN：
+  - **IP 字面量** (IPv4/IPv6): 通过 RIPEstat `network-info` 端点拿到 ASN 后再走原有 `as-overview` + `whois` 流程。
+  - **域名 / URL**: `urllib.parse` 提取 host (剥离 scheme / port / path / query / IPv6 ``[]`` 包裹)，异步 `loop.getaddrinfo` 解析为 IP 再查 ASN。
+  - 输出新增 ``"(来自 <来源>)"`` 标注，例如 ``"AS13335 (来自 www.cloudflare.com → 104.16.123.96)"``。
+- 域名解析后的 IP 会再次经过 `_reject_reserved_ip` 校验，避免 `https://localhost`、内网域名等绕过保留段判断造成无意义查询。
+
+### 变更
+- `cmd_asn` 拆分为 `_parse_asn_input` (纯字符串解析与校验) + `_resolve_host_to_asn` (DNS 与 network-info 网络查询) + 主流程调度三段，单函数职责更聚焦。
+- `_format_asn_reply` 新增可选 `source` 参数用于标注 IP→ASN 反查链路。
+- `/asn` 用法说明扩展为 ``"<AS号|IP|域名|URL>"`` 并附四条示例。
+
 ## [v0.2.1] - 2026-05-04
 
 ### 修复

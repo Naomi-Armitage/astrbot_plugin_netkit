@@ -2,8 +2,9 @@
 
 Registers:
 - `/ip <IPv4|IPv6|域名>` — geolocation summary via ip-api.com
-- `/asn <AS号>` — ASN ownership / RIR info via stat.ripe.net (RIPEstat:
-  `as-overview` + `whois` 端点合并)
+- `/asn <AS号|IP|域名|URL>` — ASN ownership / RIR info via stat.ripe.net
+  (RIPEstat: `as-overview` + `whois` 端点；非 ASN 输入先经 `network-info`
+  反查 ASN，域名走异步 getaddrinfo 解析为 IP)
 
 后续可在此基础上扩展更多网络诊断/查询命令 (ping、dns、whois 等)。
 """
@@ -13,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import re
+import urllib.parse
 from typing import Any
 
 import aiohttp
@@ -35,6 +37,7 @@ _MAX_TARGET_LEN = 253
 # RIPEstat — ASN 归属
 _ASN_OVERVIEW_URL = "https://stat.ripe.net/data/as-overview/data.json?resource=AS{asn}"
 _ASN_WHOIS_URL = "https://stat.ripe.net/data/whois/data.json?resource=AS{asn}"
+_ASN_NETWORK_INFO_URL = "https://stat.ripe.net/data/network-info/data.json?resource={ip}"
 _ASN_INPUT_RE = re.compile(r"^(?:AS)?(\d{1,10})$", re.IGNORECASE)
 _ASN_MAX = 4_294_967_295  # 32-bit ASN upper bound
 
@@ -116,37 +119,37 @@ class NetKitPlugin(Star):
 
     @filter.command("asn")
     async def cmd_asn(self, event: AstrMessageEvent, target: str = ""):
-        """查询 ASN 归属信息。用法: /asn <AS号>，例如 /asn AS13335 或 /asn 13335"""
+        """查询 ASN 归属信息。用法: /asn <AS号|IP|域名|URL>"""
         raw = (target or "").strip()
         if not raw:
             yield event.plain_result(
-                "用法: /asn <AS号>\n示例:\n  /asn AS13335\n  /asn 45102"
+                "用法: /asn <AS号|IP|域名|URL>\n示例:\n"
+                "  /asn AS13335\n"
+                "  /asn 47.238.146.96\n"
+                "  /asn https://1.1.1.1\n"
+                "  /asn https://api.bgpview.io:443"
             )
             return
 
-        match = _ASN_INPUT_RE.match(raw)
-        if match is None:
-            yield event.plain_result(
-                "[NetKit] 输入无效: 仅支持纯数字或带 AS 前缀的 ASN，例如 AS13335。"
-            )
-            return
-
-        asn_number = int(match.group(1))
-        # 输入合法性 (范围) 在前；保留段判断在后 — 两类拒绝语义独立。
-        if asn_number > _ASN_MAX:
-            yield event.plain_result(
-                "[NetKit] 输入无效: ASN 超出 32 位范围 (0–4294967295)。"
-            )
-            return
-        reject_reason = _reject_reserved_asn(asn_number)
-        if reject_reason is not None:
-            yield event.plain_result(f"[NetKit] 拒绝查询: {reject_reason}")
+        asn_number, host, parse_error = _parse_asn_input(raw)
+        if parse_error is not None:
+            yield event.plain_result(parse_error)
             return
 
         if self._session is None:
             yield event.plain_result("[NetKit] 插件未就绪，请稍后再试。")
             return
 
+        source_note: str | None = None
+        if host is not None:
+            asn_number, source_note, lookup_error = await _resolve_host_to_asn(
+                self._session, host
+            )
+            if lookup_error is not None:
+                yield event.plain_result(lookup_error)
+                return
+
+        assert asn_number is not None  # guaranteed by the branches above
         urls = (
             _ASN_OVERVIEW_URL.format(asn=asn_number),
             _ASN_WHOIS_URL.format(asn=asn_number),
@@ -182,7 +185,9 @@ class NetKitPlugin(Star):
             )
             return
 
-        yield event.plain_result(_format_asn_reply(asn_number, overview, whois))
+        yield event.plain_result(
+            _format_asn_reply(asn_number, overview, whois, source_note)
+        )
 
 
 def _reject_reserved_ip(target: str) -> str | None:
@@ -296,8 +301,13 @@ def _format_asn_reply(
     asn: int,
     overview: dict[str, Any] | None,
     whois: dict[str, Any] | None,
+    source: str | None = None,
 ) -> str:
-    """Render RIPEstat payloads (whois 优先 + overview 补全) -> Chinese summary."""
+    """Render RIPEstat payloads (whois 优先 + overview 补全) -> Chinese summary.
+
+    ``source`` 用于标注 IP/域名反查的来源（例如 ``"47.238.146.96"`` 或
+    ``"api.bgpview.io → 1.2.3.4"``）；ASN 直接查询时为 None。
+    """
     # APNIC/RIPE/LACNIC 风格的 whois 才有 as-name/descr；ARIN 注册的 ASN 这两项缺失，
     # 改由 overview.holder ("CLOUDFLARENET - Cloudflare, Inc.") 拆解后补全。
     name = _whois_first(whois, "as-name")
@@ -324,8 +334,11 @@ def _format_asn_reply(
         if "announced" in overview:
             announced = "是" if overview["announced"] else "否"
 
+    header = f"查询 ASN: AS{asn}"
+    if source:
+        header += f" (来自 {source})"
     return "\n".join([
-        f"查询 ASN: AS{asn}",
+        header,
         f"名称: {name}",
         f"描述: {description}",
         f"国家: {country}",
@@ -333,6 +346,161 @@ def _format_asn_reply(
         f"是否公告: {announced}",
         "数据源: RIPEstat",
     ])
+
+
+def _extract_host(raw: str) -> str:
+    """Extract a host (IP literal or domain) from URL / host:port / bare forms.
+
+    覆盖以下输入：
+
+    - 直接 IP 字面量：``"1.1.1.1"`` / ``"[::1]"`` / ``"2001:db8::1"``
+    - host[:port]：``"api.bgpview.io:443"`` / ``"[::1]:8080"``
+    - 完整 URL：``"https://example.com/foo?x=1"`` / ``"https://[::1]:8080/p"``
+
+    返回剥离 scheme / port / path / query / IPv6 ``[]`` 后的 host。
+    """
+    s = raw.strip().strip('"\'')
+    if not s:
+        return s
+    # 直接 IP 字面量优先（含 [::1] 包裹），避免裸 IPv6 被 urlsplit 当成 host:port。
+    candidate = s[1:-1] if s.startswith("[") and s.endswith("]") else s
+    try:
+        ipaddress.ip_address(candidate)
+        return candidate
+    except ValueError:
+        pass
+    # 否则按 URL 处理：用 // 让 urlsplit 把 host[:port] 当作 netloc 解析。
+    target = s if "://" in s else "//" + s
+    try:
+        host = urllib.parse.urlsplit(target).hostname
+    except ValueError:
+        return s
+    return host or s
+
+
+def _parse_asn_input(raw: str) -> tuple[int | None, str | None, str | None]:
+    """Classify the raw input and surface validation errors.
+
+    Returns ``(asn_number, host, error_text)``：
+
+    - ASN 数字输入：``(asn_number, None, None)``
+    - IP/域名/URL 输入：``(None, host, None)``
+    - 输入非法或落入保留段：``(None, None, error_text)``
+
+    主流程不必关心两路分支的内部判断顺序，只看返回值。
+    """
+    asn_match = _ASN_INPUT_RE.match(raw)
+    if asn_match:
+        asn = int(asn_match.group(1))
+        if asn > _ASN_MAX:
+            return None, None, "[NetKit] 输入无效: ASN 超出 32 位范围 (0–4294967295)。"
+        reject = _reject_reserved_asn(asn)
+        if reject is not None:
+            return None, None, f"[NetKit] 拒绝查询: {reject}"
+        return asn, None, None
+
+    host = _extract_host(raw)
+    if (
+        not host
+        or len(host) > _MAX_TARGET_LEN
+        or not _ALLOWED_TARGET_RE.match(host)
+    ):
+        return (
+            None,
+            None,
+            "[NetKit] 输入无效: 期望 ASN 编号、IP 或域名/URL。",
+        )
+    reject = _reject_reserved_ip(host)
+    if reject is not None:
+        return None, None, f"[NetKit] 拒绝查询: {reject}"
+    return None, host, None
+
+
+async def _resolve_to_ip(host: str) -> str | None:
+    """Async DNS resolve ``host`` to its first IP. IP literals pass through."""
+    try:
+        ipaddress.ip_address(host)
+        return host
+    except ValueError:
+        pass
+    loop = asyncio.get_running_loop()
+    try:
+        infos = await loop.getaddrinfo(host, None)
+    except OSError:
+        return None
+    for info in infos:
+        sockaddr = info[4]
+        if sockaddr and sockaddr[0]:
+            return sockaddr[0]
+    return None
+
+
+async def _lookup_asn_for_ip(
+    session: aiohttp.ClientSession, ip: str
+) -> int | None:
+    """Return the first announced ASN for ``ip`` via RIPEstat ``network-info``."""
+    data = await _fetch_ripe_data(
+        session, _ASN_NETWORK_INFO_URL.format(ip=ip)
+    )
+    if not isinstance(data, dict):
+        return None
+    asns = data.get("asns")
+    if not isinstance(asns, list):
+        return None
+    for entry in asns:
+        try:
+            return int(entry)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+async def _resolve_host_to_asn(
+    session: aiohttp.ClientSession, host: str
+) -> tuple[int | None, str | None, str | None]:
+    """Resolve ``host`` to an IP, then look up its announced ASN.
+
+    Returns ``(asn_number, source_note, error_text)``. On success exactly one of
+    ``asn_number`` and ``error_text`` is set; ``source_note`` describes the
+    lookup chain for display, e.g. ``"api.bgpview.io → 1.2.3.4"`` or just
+    ``"47.238.146.96"`` when the input was already an IP.
+    """
+    try:
+        ip = await asyncio.wait_for(
+            _resolve_to_ip(host), timeout=_HTTP_TIMEOUT_SECONDS
+        )
+    except asyncio.TimeoutError:
+        return None, None, f"[NetKit] DNS 解析超时: {host}"
+    if ip is None:
+        return None, None, f"[NetKit] 无法解析 {host}"
+
+    # SSRF / 无意义查询防护：解析后的 IP 再次走保留段判断。
+    reject = _reject_reserved_ip(ip)
+    if reject is not None:
+        return (
+            None,
+            None,
+            f"[NetKit] 拒绝查询: {host} 解析到 {ip}（{reject}）",
+        )
+
+    try:
+        asn = await _lookup_asn_for_ip(session, ip)
+    except asyncio.TimeoutError:
+        return None, None, "[NetKit] 查询超时，请稍后再试。"
+    except aiohttp.ClientError as exc:
+        logger.warning("[NetKit] network-info error for %s: %s", ip, exc)
+        return None, None, f"[NetKit] 网络错误: {exc}"
+    except ValueError:
+        return None, None, "[NetKit] 上游返回数据无法解析。"
+    if asn is None:
+        return (
+            None,
+            None,
+            f"[NetKit] 未能从 {host} ({ip}) 查到关联的 ASN（可能未公告或未分配）。",
+        )
+
+    source_note = host if host == ip else f"{host} → {ip}"
+    return asn, source_note, None
 
 
 async def _fetch_ripe_data(
