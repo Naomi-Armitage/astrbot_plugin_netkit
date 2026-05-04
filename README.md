@@ -2,6 +2,8 @@
 
 AstrBot 网络工具集插件 (NetKit). 短期目标: IP/ASN 等信息查询; 长期目标: 加入 ping、dns、whois 等基础诊断命令.
 
+版本变更见 [CHANGELOG.md](CHANGELOG.md).
+
 ## 功能
 
 - `/ip` 支持 IPv4, IPv6 与域名 (域名会被自动解析为 IP)
