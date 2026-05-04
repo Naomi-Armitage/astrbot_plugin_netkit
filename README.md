@@ -48,19 +48,18 @@ ASN: AS13335 Cloudflare, Inc.
 名称: CLOUDFLARENET
 描述: Cloudflare, Inc.
 国家: US
-网站: https://www.cloudflare.com
-流量估算: 5-10Gbps
-流量比例: Mostly Outbound
 RIR: ARIN
-分配日期: 2010-07-14
+是否公告: 是
+数据源: RIPEstat
 ```
 
 ## 数据来源
 
 - IP 归属: [ip-api.com](https://ip-api.com/) `/json/<query>?lang=zh-CN`
   - 免费额度: 45 次/分钟, 仅 HTTP
-- ASN 归属: [bgpview.io](https://bgpview.io/) `/asn/<number>`
+- ASN 归属: [RIPEstat](https://stat.ripe.net/) `as-overview` + `whois` 端点合并
   - 免费、无需 key, 走 HTTPS
+  - 不同 RIR 字段命名有差异 (APNIC: `as-name`/`descr`/`country`; ARIN: `OrgName`/`Country`); 名称与描述统一回退到 overview 的 `holder` 字段拆解
 
 ## 安装
 

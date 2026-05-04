@@ -2,7 +2,8 @@
 
 Registers:
 - `/ip <IPv4|IPv6|域名>` — geolocation summary via ip-api.com
-- `/asn <AS号>` — ASN ownership / RIR info via bgpview.io
+- `/asn <AS号>` — ASN ownership / RIR info via stat.ripe.net (RIPEstat:
+  `as-overview` + `whois` 端点合并)
 
 后续可在此基础上扩展更多网络诊断/查询命令 (ping、dns、whois 等)。
 """
@@ -20,15 +21,20 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
 
-_API_URL = "http://ip-api.com/json/{query}"
-_API_PARAMS = {"lang": "zh-CN"}
-_API_TIMEOUT_SECONDS = 10
+# Shared HTTP client timeout (used by both ip-api and RIPEstat sessions).
+_HTTP_TIMEOUT_SECONDS = 10
+
+# ip-api.com — IP / 域名归属地
+_IP_API_URL = "http://ip-api.com/json/{query}"
+_IP_API_PARAMS = {"lang": "zh-CN"}
 # Permissive sanity check: hostnames + IPv4/IPv6 literals fit within these chars.
 # Reject anything else early to avoid sending junk to the upstream API.
 _ALLOWED_TARGET_RE = re.compile(r"^[A-Za-z0-9_.\-:\[\]]+$")
 _MAX_TARGET_LEN = 253
 
-_ASN_API_URL = "https://api.bgpview.io/asn/{asn}"
+# RIPEstat — ASN 归属
+_ASN_OVERVIEW_URL = "https://stat.ripe.net/data/as-overview/data.json?resource=AS{asn}"
+_ASN_WHOIS_URL = "https://stat.ripe.net/data/whois/data.json?resource=AS{asn}"
 _ASN_INPUT_RE = re.compile(r"^(?:AS)?(\d{1,10})$", re.IGNORECASE)
 _ASN_MAX = 4_294_967_295  # 32-bit ASN upper bound
 
@@ -41,7 +47,7 @@ class NetKitPlugin(Star):
         self._session: aiohttp.ClientSession | None = None
 
     async def initialize(self) -> None:
-        timeout = aiohttp.ClientTimeout(total=_API_TIMEOUT_SECONDS)
+        timeout = aiohttp.ClientTimeout(total=_HTTP_TIMEOUT_SECONDS)
         self._session = aiohttp.ClientSession(timeout=timeout)
 
     async def terminate(self) -> None:
@@ -81,7 +87,7 @@ class NetKitPlugin(Star):
         query = target[1:-1] if target.startswith("[") and target.endswith("]") else target
         try:
             async with self._session.get(
-                _API_URL.format(query=query), params=_API_PARAMS
+                _IP_API_URL.format(query=query), params=_IP_API_PARAMS
             ) as resp:
                 if resp.status != 200:
                     yield event.plain_result(
@@ -126,6 +132,12 @@ class NetKitPlugin(Star):
             return
 
         asn_number = int(match.group(1))
+        # 输入合法性 (范围) 在前；保留段判断在后 — 两类拒绝语义独立。
+        if asn_number > _ASN_MAX:
+            yield event.plain_result(
+                "[NetKit] 输入无效: ASN 超出 32 位范围 (0–4294967295)。"
+            )
+            return
         reject_reason = _reject_reserved_asn(asn_number)
         if reject_reason is not None:
             yield event.plain_result(f"[NetKit] 拒绝查询: {reject_reason}")
@@ -135,39 +147,42 @@ class NetKitPlugin(Star):
             yield event.plain_result("[NetKit] 插件未就绪，请稍后再试。")
             return
 
-        try:
-            async with self._session.get(_ASN_API_URL.format(asn=asn_number)) as resp:
-                if resp.status != 200:
-                    yield event.plain_result(
-                        f"[NetKit] 上游接口异常: HTTP {resp.status}"
-                    )
-                    return
-                payload: dict[str, Any] = await resp.json(content_type=None)
-        except asyncio.TimeoutError:
-            yield event.plain_result("[NetKit] 查询超时，请稍后再试。")
-            return
-        except aiohttp.ClientError as exc:
-            logger.warning("[NetKit] ASN network error for AS%s: %s", asn_number, exc)
-            yield event.plain_result(f"[NetKit] 网络错误: {exc}")
-            return
-        except ValueError as exc:
-            logger.warning("[NetKit] ASN invalid JSON for AS%s: %s", asn_number, exc)
-            yield event.plain_result("[NetKit] 上游返回数据无法解析。")
-            return
+        urls = (
+            _ASN_OVERVIEW_URL.format(asn=asn_number),
+            _ASN_WHOIS_URL.format(asn=asn_number),
+        )
+        results = await asyncio.gather(
+            *(_fetch_ripe_data(self._session, u) for u in urls),
+            return_exceptions=True,
+        )
+        overview = results[0] if isinstance(results[0], dict) else None
+        whois = results[1] if isinstance(results[1], dict) else None
 
-        if payload.get("status") != "ok":
-            reason = payload.get("status_message") or "未知错误"
-            yield event.plain_result(f"[NetKit] 查询失败: {reason}")
-            return
+        # 即使一端拿到数据也记录另一端的故障 — 否则 production 故障会被吞。
+        for url, r in zip(urls, results):
+            if isinstance(r, BaseException):
+                logger.warning(
+                    "[NetKit] ASN partial fetch failed url=%s err=%r", url, r
+                )
 
-        data = payload.get("data") or {}
-        if not data:
+        if overview is None and whois is None:
+            excs = [r for r in results if isinstance(r, BaseException)]
+            if any(isinstance(e, asyncio.TimeoutError) for e in excs):
+                yield event.plain_result("[NetKit] 查询超时，请稍后再试。")
+                return
+            net_excs = [e for e in excs if isinstance(e, aiohttp.ClientError)]
+            if net_excs:
+                yield event.plain_result(f"[NetKit] 网络错误: {net_excs[0]}")
+                return
+            if excs:
+                yield event.plain_result("[NetKit] 上游返回数据无法解析。")
+                return
             yield event.plain_result(
                 f"[NetKit] 未找到 AS{asn_number} 的信息（可能未分配）。"
             )
             return
 
-        yield event.plain_result(_format_asn_reply(asn_number, data))
+        yield event.plain_result(_format_asn_reply(asn_number, overview, whois))
 
 
 def _reject_reserved_ip(target: str) -> str | None:
@@ -239,11 +254,12 @@ def _format_reply(target: str, data: dict[str, Any]) -> str:
 
 
 def _reject_reserved_asn(asn: int) -> str | None:
-    """Return a Chinese reason if the ASN is reserved/private, else None."""
+    """Return a Chinese reason if the ASN is reserved/private/documentation.
+
+    调用方需先确保 ``0 <= asn <= 4294967295``；此函数只判断该范围内的特殊段。
+    """
     if asn == 0 or asn == 65535 or asn == _ASN_MAX:
         return "保留 ASN 不在查询范围。"
-    if asn > _ASN_MAX:
-        return "ASN 超出 32 位范围 (0–4294967295)。"
     if 64512 <= asn <= 65534:
         return "16 位私有 ASN (64512–65534) 不在查询范围。"
     if 4_200_000_000 <= asn <= 4_294_967_294:
@@ -253,30 +269,86 @@ def _reject_reserved_asn(asn: int) -> str | None:
     return None
 
 
-def _format_asn_reply(asn: int, data: dict[str, Any]) -> str:
-    """Render the bgpview ASN payload as a Chinese plain-text summary."""
+def _whois_first(whois: dict[str, Any] | None, *keys: str) -> str:
+    """Return the first non-empty value for any of ``keys`` in a whois payload.
 
-    def pick(key: str) -> str:
-        value = data.get(key)
-        if value is None or value == "":
-            return "-"
-        return str(value)
+    Whois 端点返回的 ``records`` 是 ``List[List[Dict]]`` 嵌套数组；不同 RIR 用
+    不同 key (APNIC: ``as-name``/``descr``/``country``；ARIN: ``OrgName``/``Country``)，
+    因此匹配采用大小写不敏感。命中第一个非空值后立即返回。
+    """
+    if not isinstance(whois, dict) or not keys:
+        return "-"
+    targets = {k.lower() for k in keys}
+    for record in whois.get("records") or []:
+        for item in record or []:
+            if not isinstance(item, dict):
+                continue
+            key = item.get("key")
+            if not isinstance(key, str) or key.lower() not in targets:
+                continue
+            value = item.get("value")
+            if value:
+                return str(value)
+    return "-"
 
-    rir = data.get("rir_allocation") or {}
-    rir_name = rir.get("rir_name") or "-"
-    allocated = rir.get("date_allocated") or "-"
-    if isinstance(allocated, str) and " " in allocated:
-        allocated = allocated.split(" ", 1)[0]  # YYYY-MM-DD only
 
-    lines = [
+def _format_asn_reply(
+    asn: int,
+    overview: dict[str, Any] | None,
+    whois: dict[str, Any] | None,
+) -> str:
+    """Render RIPEstat payloads (whois 优先 + overview 补全) -> Chinese summary."""
+    # APNIC/RIPE/LACNIC 风格的 whois 才有 as-name/descr；ARIN 注册的 ASN 这两项缺失，
+    # 改由 overview.holder ("CLOUDFLARENET - Cloudflare, Inc.") 拆解后补全。
+    name = _whois_first(whois, "as-name")
+    description = _whois_first(whois, "descr")
+    country = _whois_first(whois, "country", "Country")
+    rir = "-"
+    announced = "-"
+
+    if isinstance(overview, dict):
+        holder = overview.get("holder")
+        if isinstance(holder, str) and holder.strip():
+            # ARIN 风格: "GOOGLE - Google LLC"; APNIC 风格: "ALIBABA-CN-NET Alibaba ..."
+            if " - " in holder:
+                head, _, tail = holder.partition(" - ")
+            else:
+                head, _, tail = holder.partition(" ")
+            if name == "-":
+                name = head or holder
+            if description == "-" and tail.strip():
+                description = tail.strip()
+        block_desc = (overview.get("block") or {}).get("desc")
+        if isinstance(block_desc, str) and block_desc:
+            rir = block_desc.removeprefix("Assigned by ").strip() or block_desc
+        if "announced" in overview:
+            announced = "是" if overview["announced"] else "否"
+
+    return "\n".join([
         f"查询 ASN: AS{asn}",
-        f"名称: {pick('name')}",
-        f"描述: {pick('description_short')}",
-        f"国家: {pick('country_code')}",
-        f"网站: {pick('website')}",
-        f"流量估算: {pick('traffic_estimation')}",
-        f"流量比例: {pick('traffic_ratio')}",
-        f"RIR: {rir_name}",
-        f"分配日期: {allocated}",
-    ]
-    return "\n".join(lines)
+        f"名称: {name}",
+        f"描述: {description}",
+        f"国家: {country}",
+        f"RIR: {rir}",
+        f"是否公告: {announced}",
+        "数据源: RIPEstat",
+    ])
+
+
+async def _fetch_ripe_data(
+    session: aiohttp.ClientSession, url: str
+) -> dict[str, Any] | None:
+    """Call a RIPEstat data endpoint and return the `data` object on success.
+
+    Returns None when the upstream signals an unsupported / empty resource;
+    raises asyncio.TimeoutError / aiohttp.ClientError / ValueError on transport
+    or parse failures so the caller can surface a specific error.
+    """
+    async with session.get(url) as resp:
+        if resp.status != 200:
+            return None
+        payload = await resp.json(content_type=None)
+    if not isinstance(payload, dict) or payload.get("status") != "ok":
+        return None
+    data = payload.get("data")
+    return data if isinstance(data, dict) and data else None
