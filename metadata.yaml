@@ -1,7 +1,7 @@
 name: astrbot_plugin_netkit
 display_name: 网络工具集 (NetKit)
 desc: AstrBot 网络工具集插件。当前支持 IP / 域名归属地查询 (/ip)、ASN 归属与 RIR 信息查询 (/asn)，后续将加入更多网络诊断与查询命令。
-version: v0.2.2
+version: v0.2.3
 author: Naomi-Armitage
 repo: https://github.com/Naomi-Armitage/astrbot_plugin_netkit
 astrbot_version: ">=4.17.0"

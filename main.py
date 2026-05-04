@@ -29,6 +29,10 @@ _HTTP_TIMEOUT_SECONDS = 10
 # ip-api.com — IP / 域名归属地
 _IP_API_URL = "http://ip-api.com/json/{query}"
 _IP_API_PARAMS = {"lang": "zh-CN"}
+# ipwho.is — 用于多 IP 场景下"另解析的 IP"精简查询；官方声明免费无限、无需 key、走 HTTPS。
+_IPWHOIS_URL = "https://ipwho.is/{ip}"
+# 多 IP 输出 cap：CDN 域名可能解析出 100+ 个 IP，全部展示既无意义也浪费上游请求。
+_MAX_EXTRA_IPS = 10
 # Permissive sanity check: hostnames + IPv4/IPv6 literals fit within these chars.
 # Reject anything else early to avoid sending junk to the upstream API.
 _ALLOWED_TARGET_RE = re.compile(r"^[A-Za-z0-9_.\-:\[\]]+$")
@@ -63,21 +67,30 @@ class NetKitPlugin(Star):
 
     @filter.command("ip")
     async def cmd_ip(self, event: AstrMessageEvent, target: str = ""):
-        """查询 IP / 域名归属地。用法: /ip <IPv4|IPv6|域名>"""
-        target = (target or "").strip()
-        if not target:
+        """查询 IP / 域名归属地。用法: /ip <IPv4|IPv6|域名|URL>"""
+        raw = (target or "").strip()
+        if not raw:
             yield event.plain_result(
-                "用法: /ip <IPv4|IPv6|域名>\n示例:\n  /ip 1.1.1.1\n  /ip example.com"
+                "用法: /ip <IPv4|IPv6|域名|URL>\n示例:\n"
+                "  /ip 1.1.1.1\n"
+                "  /ip 38.76.141.233:28367\n"
+                "  /ip example.com\n"
+                "  /ip https://www.cloudflare.com:443/foo"
             )
             return
 
-        if len(target) > _MAX_TARGET_LEN or not _ALLOWED_TARGET_RE.match(target):
+        if len(raw) > _MAX_TARGET_LEN:
+            yield event.plain_result("[NetKit] 输入无效: 超长。")
+            return
+
+        host = _extract_host(raw)
+        if not host or not _ALLOWED_TARGET_RE.match(host):
             yield event.plain_result(
-                "[NetKit] 输入无效: 仅支持 IPv4 / IPv6 / 域名。"
+                "[NetKit] 输入无效: 仅支持 IPv4 / IPv6 / 域名 / URL。"
             )
             return
 
-        reject_reason = _reject_reserved_ip(target)
+        reject_reason = _reject_reserved_ip(host)
         if reject_reason is not None:
             yield event.plain_result(f"[NetKit] 拒绝查询: {reject_reason}")
             return
@@ -86,36 +99,59 @@ class NetKitPlugin(Star):
             yield event.plain_result("[NetKit] 插件未就绪，请稍后再试。")
             return
 
-        # ip-api.com path segment expects bare IPv6 (no [] wrapper).
-        query = target[1:-1] if target.startswith("[") and target.endswith("]") else target
         try:
-            async with self._session.get(
-                _IP_API_URL.format(query=query), params=_IP_API_PARAMS
-            ) as resp:
-                if resp.status != 200:
-                    yield event.plain_result(
-                        f"[NetKit] 上游接口异常: HTTP {resp.status}"
-                    )
-                    return
-                data: dict[str, Any] = await resp.json(content_type=None)
+            ips = await asyncio.wait_for(
+                _resolve_to_ips(host), timeout=_HTTP_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            yield event.plain_result(f"[NetKit] DNS 解析超时: {host}")
+            return
+        if not ips:
+            yield event.plain_result(f"[NetKit] 无法解析 {host}")
+            return
+
+        # SSRF / 无意义查询防护：解析后的每一个 IP 再次校验保留段。
+        for ip in ips:
+            rej = _reject_reserved_ip(ip)
+            if rej is not None:
+                yield event.plain_result(
+                    f"[NetKit] 拒绝查询: {host} 解析到 {ip}（{rej}）"
+                )
+                return
+
+        # 首个 IP 走 ip-api 拿全字段中文详细信息。
+        primary_ip = ips[0]
+        try:
+            primary_text = await _query_ip_api_detail(self._session, host, primary_ip)
         except asyncio.TimeoutError:
             yield event.plain_result("[NetKit] 查询超时，请稍后再试。")
             return
         except aiohttp.ClientError as exc:
-            logger.warning("[NetKit] network error for %r: %s", target, exc)
+            logger.warning("[NetKit] ip-api error for %s: %s", primary_ip, exc)
             yield event.plain_result(f"[NetKit] 网络错误: {exc}")
             return
         except ValueError as exc:
-            logger.warning("[NetKit] invalid JSON for %r: %s", target, exc)
+            logger.warning("[NetKit] ip-api invalid JSON for %s: %s", primary_ip, exc)
             yield event.plain_result("[NetKit] 上游返回数据无法解析。")
             return
-
-        if data.get("status") != "success":
-            reason = data.get("message") or "未知错误"
-            yield event.plain_result(f"[NetKit] 查询失败: {reason}")
+        if primary_text is None:
+            yield event.plain_result(
+                f"[NetKit] 上游接口异常或查询失败: {primary_ip}"
+            )
             return
 
-        yield event.plain_result(_format_reply(target, data))
+        # 多 IP 场景：剩余 IP 用 ipwho.is 拿精简一行（无配额限制）。
+        extras = ips[1 : 1 + _MAX_EXTRA_IPS]
+        truncated = len(ips) - 1 - len(extras)
+        if extras:
+            extra_lines = await _format_extra_ips(self._session, extras)
+            header = f"— 另解析到 {len(ips) - 1} 个 IP"
+            if truncated > 0:
+                header += f"（仅显示前 {len(extras)} 个）"
+            header += "（数据源 ipwho.is）—"
+            primary_text = f"{primary_text}\n\n{header}\n{extra_lines}"
+
+        yield event.plain_result(primary_text)
 
     @filter.command("asn")
     async def cmd_asn(self, event: AstrMessageEvent, target: str = ""):
@@ -416,23 +452,97 @@ def _parse_asn_input(raw: str) -> tuple[int | None, str | None, str | None]:
     return None, host, None
 
 
-async def _resolve_to_ip(host: str) -> str | None:
-    """Async DNS resolve ``host`` to its first IP. IP literals pass through."""
+async def _resolve_to_ips(host: str) -> list[str]:
+    """Async DNS resolve ``host`` to all unique IPs (in order). IP literals
+    pass through as a single-element list.
+
+    Used by ``cmd_ip`` (展示所有解析结果) and ``_resolve_to_ip`` (反查 ASN
+    时只需第一个)。
+    """
     try:
         ipaddress.ip_address(host)
-        return host
+        return [host]
     except ValueError:
         pass
     loop = asyncio.get_running_loop()
     try:
         infos = await loop.getaddrinfo(host, None)
     except OSError:
-        return None
+        return []
+    seen: set[str] = set()
+    ips: list[str] = []
     for info in infos:
         sockaddr = info[4]
-        if sockaddr and sockaddr[0]:
-            return sockaddr[0]
-    return None
+        if not sockaddr:
+            continue
+        ip = sockaddr[0]
+        if ip and ip not in seen:
+            seen.add(ip)
+            ips.append(ip)
+    return ips
+
+
+async def _resolve_to_ip(host: str) -> str | None:
+    """Async DNS resolve ``host`` to its first IP. IP literals pass through."""
+    ips = await _resolve_to_ips(host)
+    return ips[0] if ips else None
+
+
+async def _query_ip_api_detail(
+    session: aiohttp.ClientSession, label: str, ip: str
+) -> str | None:
+    """Query ip-api for ``ip`` and render the Chinese summary keyed on ``label``.
+
+    Returns formatted text on success, or None when the upstream returned a
+    non-200 / status != "success" payload. Transport / parse errors propagate.
+    """
+    async with session.get(
+        _IP_API_URL.format(query=ip), params=_IP_API_PARAMS
+    ) as resp:
+        if resp.status != 200:
+            return None
+        data: dict[str, Any] = await resp.json(content_type=None)
+    if data.get("status") != "success":
+        return None
+    return _format_reply(label, data)
+
+
+async def _query_ipwhois(
+    session: aiohttp.ClientSession, ip: str
+) -> dict[str, Any] | None:
+    """Single-IP query against ipwho.is. Returns the JSON dict or None."""
+    async with session.get(_IPWHOIS_URL.format(ip=ip)) as resp:
+        if resp.status != 200:
+            return None
+        return await resp.json(content_type=None)
+
+
+async def _format_extra_ips(
+    session: aiohttp.ClientSession, ips: list[str]
+) -> str:
+    """Concurrently fetch ipwho.is summaries for ``ips`` and render one per line.
+
+    Per-IP failures degrade to ``"<ip> — 查询失败"`` rather than aborting the
+    whole list.
+    """
+    results = await asyncio.gather(
+        *(_query_ipwhois(session, ip) for ip in ips),
+        return_exceptions=True,
+    )
+    lines: list[str] = []
+    for ip, r in zip(ips, results):
+        if isinstance(r, BaseException):
+            logger.warning("[NetKit] ipwho.is failed for %s: %r", ip, r)
+            lines.append(f"{ip} — 查询失败")
+            continue
+        if not isinstance(r, dict) or not r.get("success", True) or "ip" not in r:
+            lines.append(f"{ip} — 查询失败")
+            continue
+        isp = (r.get("connection") or {}).get("isp") or r.get("isp") or "-"
+        parts = [r.get("country"), r.get("region"), r.get("city")]
+        location = ", ".join(p for p in parts if p) or "-"
+        lines.append(f"{ip} — {isp} ({location})")
+    return "\n".join(lines)
 
 
 async def _lookup_asn_for_ip(

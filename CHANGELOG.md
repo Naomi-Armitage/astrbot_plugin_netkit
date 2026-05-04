@@ -2,6 +2,20 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 格式，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v0.2.3] - 2026-05-04
+
+### 修复
+- `/ip` 现接受 `host:port` 与完整 URL 形式，例如 `/ip 38.76.141.233:28367` 不再因为带端口被上游 ip-api 拒绝。`cmd_ip` 入口接 `_extract_host` 剥离 scheme / port / path / query / IPv6 `[]` 包裹，与 `/asn` 输入解析共用同一 helper。
+
+### 新增
+- `/ip` 处理域名解析到多个 IP 的场景：首个 IP 走 ip-api 拿全字段中文详细信息，后续 IP 并发查询 [ipwho.is](https://ipwho.is/) 拿"运营商 (国家, 地区, 城市)"精简一行。ipwho.is 官方声明免费无配额限制，且每个 IP 一次请求，避免在 CDN 域名上耗尽 ip-api 的 45 次/分钟额度。
+- 多 IP 输出 cap 在前 10 条；超过的会注明"（仅显示前 10 个）"，避免 CDN 域名解析出 100+ 个 IP 时把消息撑爆。
+- 新增 helper `_resolve_to_ips` 返回所有去重后的 IP 列表；`_resolve_to_ip` 改为基于它的 wrapper，不影响 `/asn` 反查链路。
+
+### 变更
+- `/ip` 用法说明扩展为 `<IPv4|IPv6|域名|URL>` 并附四条示例。
+- 域名 → 多 IP 路径下，每一个解析得到的 IP 都会再次经过 `_reject_reserved_ip`（与 `/asn` 一致），防止 `https://localhost`、内网域名等绕过保留段判断。
+
 ## [v0.2.2] - 2026-05-04
 
 ### 新增
