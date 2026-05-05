@@ -70,6 +70,21 @@ _DOH_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
 )
 _DOH_PER_ENDPOINT_TIMEOUT = 3.0  # 单端点超时，慢的解析器不拖累其他
 
+# EDNS Client Subnet (RFC 7871) 探测：部分权威 DNS 按 client subnet 给定制
+# IP（机场代理、CDN GeoDNS 常见做法）。只查 DoH 服务器自己的出口视角会漏掉
+# "大陆电信/联通/移动等用户实际看到的 IP"。我们在 Google JSON DoH 上注入若干
+# 代表性 subnet 的 ECS 选项强制权威按那个网段分流，聚合到本地视角列表里。
+# 选 /24 是因为权威 DNS 通常按 /24 粒度做 ECS 分组（更细的精度多数都被聚合）。
+_ECS_VANTAGES: tuple[tuple[str, str], ...] = (
+    ("CN-CT",  "61.139.2.0/24"),     # 四川电信骨干
+    ("CN-CU",  "123.125.81.0/24"),   # 北京联通
+    ("CN-CM",  "221.179.38.0/24"),   # 北京移动
+    ("CN-EDU", "202.112.0.0/24"),    # 教育网 (清华)
+    ("HK",     "203.80.96.0/24"),    # HK PCCW
+    ("TW",     "168.95.1.0/24"),     # 中华电信
+)
+_ECS_DOH_URL = "https://dns.google/resolve"  # 已确认稳定支持 edns_client_subnet
+
 # AlienVault OTX — passive DNS 历史。免费、无需 key，按 hostname 查询会返回该
 # host 历史出现过的所有解析答案（含 first/last 时间戳）。dynamic / proxy 类
 # 子域名通常 0 records；主域 / 高流量域名能拿到几百条。
@@ -633,6 +648,7 @@ async def _query_doh(
     mode: str,
     host: str,
     rrtype: int,
+    ecs: str | None = None,
 ) -> list[str]:
     """Query a single DoH endpoint for ``host`` ``rrtype``.
 
@@ -640,13 +656,20 @@ async def _query_doh(
     JSON DoH) and ``"wire"`` (RFC 8484, application/dns-message). Per-endpoint
     timeout is enforced by the caller via ``asyncio.wait_for``.
 
+    ``ecs`` (CIDR like ``"61.139.2.0/24"``) attaches an EDNS Client Subnet
+    hint via the ``edns_client_subnet`` parameter. Only takes effect on JSON
+    DoH; wire-mode currently ignores it (would need an OPT record).
+
     Returns a list of IP strings, or an empty list on any failure.
     """
     try:
         if mode == "json":
+            params = {"name": host, "type": str(rrtype)}
+            if ecs:
+                params["edns_client_subnet"] = ecs
             async with session.get(
                 url,
-                params={"name": host, "type": str(rrtype)},
+                params=params,
                 headers={"Accept": "application/dns-json"},
             ) as resp:
                 if resp.status != 200:
@@ -685,20 +708,37 @@ async def _query_doh(
 async def _resolve_via_doh(
     session: aiohttp.ClientSession, host: str
 ) -> list[str]:
-    """Concurrently query every configured DoH endpoint for both A and AAAA,
-    each capped at ``_DOH_PER_ENDPOINT_TIMEOUT``. Returns the merged IP list.
+    """Concurrently query every configured DoH endpoint plus the ECS vantage
+    set on Google JSON DoH, both for A and AAAA. Returns the merged IP list.
 
-    Order is best-effort by first appearance: callers should de-duplicate
-    while preserving order if they care about presentation.
+    Each task is independently capped at ``_DOH_PER_ENDPOINT_TIMEOUT``.
     """
-    tasks = [
-        asyncio.wait_for(
-            _query_doh(session, name, url, mode, host, rrtype),
-            timeout=_DOH_PER_ENDPOINT_TIMEOUT,
-        )
-        for name, url, mode in _DOH_ENDPOINTS
-        for rrtype in (1, 28)  # A + AAAA
-    ]
+    tasks: list[asyncio.Future[list[str]]] = []
+
+    # Per-endpoint, no ECS — captures each resolver's own vantage point.
+    for name, url, mode in _DOH_ENDPOINTS:
+        for rrtype in (1, 28):
+            tasks.append(
+                asyncio.wait_for(
+                    _query_doh(session, name, url, mode, host, rrtype),
+                    timeout=_DOH_PER_ENDPOINT_TIMEOUT,
+                )
+            )
+
+    # ECS-injected vantages on Google JSON DoH — covers carrier / region
+    # specific GeoDNS responses we'd otherwise miss.
+    for label, subnet in _ECS_VANTAGES:
+        for rrtype in (1, 28):
+            tasks.append(
+                asyncio.wait_for(
+                    _query_doh(
+                        session, f"ECS-{label}", _ECS_DOH_URL,
+                        "json", host, rrtype, ecs=subnet,
+                    ),
+                    timeout=_DOH_PER_ENDPOINT_TIMEOUT,
+                )
+            )
+
     results = await asyncio.gather(*tasks, return_exceptions=True)
     out: list[str] = []
     for r in results:

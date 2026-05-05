@@ -7,11 +7,12 @@
 ### 新增
 - `/ip` 域名解析改用 **多 DoH 视角聚合** 来发现动态分配域名的多个真实节点。系统解析器 + 9 个公共 DoH 端点 (Google / AliDNS / AdGuard / DNS.SB / DNSPod / NextDNS / 360 / LibreDNS / Tiarap) 并发查询 A 与 AAAA，每端点 3s 超时，去重后传入下游展示。设计参考 [amass](https://github.com/owasp-amass/amass) 等子域枚举工具的 multi-resolver 思路。
 - 同时实现 **RFC 8427 (JSON DoH)** 和 **RFC 8484 (wire-format DoH)** 两种调用方式，纯 stdlib 手写 DNS encode/decode (`_build_dns_query` / `_parse_dns_answer` / `_skip_dns_name`)，无新依赖；解锁了只支持 wire-format 的 360 / LibreDNS / Tiarap 等端点。
+- 进一步在 Google JSON DoH 上注入 **EDNS Client Subnet (RFC 7871) 探测**，覆盖 6 个代表性 /24 网段（CN-CT / CN-CU / CN-CM / CN-EDU / HK / TW），强制权威 DNS 按 client subnet 分流。这能发现按运营商/地区做 GeoDNS 分流的域名（典型场景：海外统一 IP，大陆按电信 / 联通 / 移动 / 教育网分别分配不同中转节点）仅特定网段才能看到的 IP。
 - 新增 `/iphist <域名|URL>` 命令查询 **passive DNS 历史 IP**，数据来自免费无 key 的 [AlienVault OTX](https://otx.alienvault.com/) `/api/v1/indicators/hostname/<host>/passive_dns` 端点。返回该 host 历史出现过的 A/AAAA 记录，含国家、ASN、首见 / 最近 时间戳，按 `last` 倒序最多 20 条。
 - OTX 接口对热门域名响应慢（10–25s 常见）；`_OTX_TIMEOUT_SECONDS=30` 单独配置，并通过 per-request `aiohttp.ClientTimeout` 覆盖 plugin 全局 10s session 超时。
 
 ### 变更
-- `_DOH_ENDPOINTS` 由二元组 `(name, url)` 改为三元组 `(name, url, mode)`，`mode` 取 `"json"` 或 `"wire"`，`_query_doh` 按 mode 分派。
+- `_DOH_ENDPOINTS` 由二元组 `(name, url)` 改为三元组 `(name, url, mode)`，`mode` 取 `"json"` 或 `"wire"`，`_query_doh` 按 mode 分派；`_query_doh` 同时新增 `ecs` 可选参数支持 EDNS Client Subnet 注入（仅 JSON 模式生效）。
 - 已知不兼容端点 Quad9 从默认列表移除（强制 HTTP/2，aiohttp 默认 HTTP/1.1 不兼容；保留注释说明）。
 
 ## [v0.2.3] - 2026-05-04
