@@ -84,6 +84,10 @@ _ECS_VANTAGES: tuple[tuple[str, str], ...] = (
     ("TW",     "168.95.1.0/24"),     # 中华电信
 )
 _ECS_DOH_URL = "https://dns.google/resolve"  # 已确认稳定支持 edns_client_subnet
+# 每个 ECS vantage 的重复查询次数，对抗权威 DNS 在同一 client subnet 内部
+# 的 round-robin（实测：单次每 vantage 只命中池里其中一个 IP，跑 3 次能稳定
+# 把同 vantage 的 2-3 个轮询节点都收集到，并发执行不影响 wall-clock 延迟）。
+_ECS_REPETITIONS = 3
 
 # AlienVault OTX — passive DNS 历史。免费、无需 key，按 hostname 查询会返回该
 # host 历史出现过的所有解析答案（含 first/last 时间戳）。dynamic / proxy 类
@@ -761,18 +765,22 @@ async def _resolve_via_doh(
             )
 
     # ECS-injected vantages on Google JSON DoH — covers carrier / region
-    # specific GeoDNS responses we'd otherwise miss.
+    # specific GeoDNS responses we'd otherwise miss. Each vantage repeats
+    # _ECS_REPETITIONS times to defeat the authoritative round-robin within
+    # a single client subnet (one shot per vantage only catches one of the
+    # rotating nodes in the pool).
     for label, subnet in _ECS_VANTAGES:
         for rrtype in (1, 28):
-            tasks.append(
-                asyncio.wait_for(
-                    _query_doh(
-                        session, f"ECS-{label}", _ECS_DOH_URL,
-                        "json", host, rrtype, ecs=subnet,
-                    ),
-                    timeout=_DOH_PER_ENDPOINT_TIMEOUT,
+            for _ in range(_ECS_REPETITIONS):
+                tasks.append(
+                    asyncio.wait_for(
+                        _query_doh(
+                            session, f"ECS-{label}", _ECS_DOH_URL,
+                            "json", host, rrtype, ecs=subnet,
+                        ),
+                        timeout=_DOH_PER_ENDPOINT_TIMEOUT,
+                    )
                 )
-            )
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
     out: list[str] = []
