@@ -374,6 +374,23 @@ def _reject_reserved_ip(target: str) -> str | None:
     return None
 
 
+def _md_code(text: str) -> str:
+    """Wrap ``text`` in markdown inline-code backticks for click-to-copy.
+
+    AstrBot's Telegram adapter renders outgoing text with
+    ``telegramify_markdown`` + ``parse_mode="MarkdownV2"``, so backtick-wrapped
+    spans become tap-to-copy on Telegram clients. Other adapters fall back to
+    showing the literal backticks; we accept that minor cosmetic cost in
+    exchange for the copy affordance where it matters most.
+
+    Empty / placeholder ``"-"`` is returned unwrapped to avoid useless ``-``
+    pills in the output.
+    """
+    if not text or text == "-":
+        return "-"
+    return f"`{text}`"
+
+
 def _format_reply(target: str, data: dict[str, Any]) -> str:
     """Render the API JSON as a Chinese plain-text summary."""
 
@@ -396,18 +413,30 @@ def _format_reply(target: str, data: dict[str, Any]) -> str:
     else:
         coords = "-"
 
+    # ip-api 的 `as` 字段把 "AS13335 Cloudflare, Inc." 拼到一起 — 拆开 ASN
+    # 编号让它单独可复制，描述部分留作纯文本。
+    as_field = pick("as")
+    if as_field != "-":
+        head, sep, tail = as_field.partition(" ")
+        if sep and head.startswith("AS") and head[2:].isdigit():
+            asn_display = f"{_md_code(head)} {tail}"
+        else:
+            asn_display = _md_code(as_field)
+    else:
+        asn_display = "-"
+
     lines = [
-        f"查询地址: {target}",
-        f"IP: {resolved_ip}",
+        f"查询地址: {_md_code(target)}",
+        f"IP: {_md_code(resolved_ip)}",
         f"国家: {country}",
         f"地区: {region}",
         f"城市: {city}",
         f"归属: {location}",
         f"运营商/ISP: {pick('isp')}",
         f"组织: {pick('org')}",
-        f"ASN: {pick('as')}",
+        f"ASN: {asn_display}",
         f"时区: {pick('timezone')}",
-        f"经纬度: {coords}",
+        f"经纬度: {_md_code(coords)}",
     ]
     return "\n".join(lines)
 
@@ -488,9 +517,15 @@ def _format_asn_reply(
         if "announced" in overview:
             announced = "是" if overview["announced"] else "否"
 
-    header = f"查询 ASN: AS{asn}"
+    header = f"查询 ASN: {_md_code(f'AS{asn}')}"
     if source:
-        header += f" (来自 {source})"
+        # source 形如 "47.238.146.96" 或 "host → 1.2.3.4"，含的 IP / 域名各自包反引号。
+        if " → " in source:
+            host_part, _, ip_part = source.partition(" → ")
+            source_display = f"{_md_code(host_part)} → {_md_code(ip_part)}"
+        else:
+            source_display = _md_code(source)
+        header += f" (来自 {source_display})"
     return "\n".join([
         header,
         f"名称: {name}",
@@ -853,15 +888,15 @@ async def _format_extra_ips(
     for ip, r in zip(ips, results):
         if isinstance(r, BaseException):
             logger.warning("[NetKit] ipwho.is failed for %s: %r", ip, r)
-            lines.append(f"{ip} — 查询失败")
+            lines.append(f"{_md_code(ip)} — 查询失败")
             continue
         if not isinstance(r, dict) or not r.get("success", True) or "ip" not in r:
-            lines.append(f"{ip} — 查询失败")
+            lines.append(f"{_md_code(ip)} — 查询失败")
             continue
         isp = (r.get("connection") or {}).get("isp") or r.get("isp") or "-"
         parts = [r.get("country"), r.get("region"), r.get("city")]
         location = ", ".join(p for p in parts if p) or "-"
-        lines.append(f"{ip} — {isp} ({location})")
+        lines.append(f"{_md_code(ip)} — {isp} ({location})")
     return "\n".join(lines)
 
 
@@ -908,7 +943,7 @@ def _format_iphist_reply(host: str, records: list[dict[str, Any]]) -> str:
     shown = records[:_IPHIST_MAX_ROWS]
     truncated = len(records) - len(shown)
     lines = [
-        f"DNS 历史 — {host}",
+        f"DNS 历史 — {_md_code(host)}",
         "数据源: AlienVault OTX (passive DNS)",
         f"共 {len(records)} 条 A/AAAA 记录" + (
             f"，仅显示最近 {len(shown)} 条" if truncated > 0 else ""
@@ -920,10 +955,19 @@ def _format_iphist_reply(host: str, records: list[dict[str, Any]]) -> str:
         first = (r.get("first") or "")[:10] or "-"
         last = (r.get("last") or "")[:10] or "-"
         country = r.get("flag_title") or "-"
-        asn = r.get("asn") or "-"
+        asn_field = r.get("asn") or "-"
+        # OTX 的 asn 字段形如 "AS13335 cloudflare"；拆 ASN 编号让它单独可复制。
+        if asn_field != "-":
+            head, sep, tail = asn_field.partition(" ")
+            if sep and head.upper().startswith("AS") and head[2:].isdigit():
+                asn_display = f"{_md_code(head)} {tail}"
+            else:
+                asn_display = _md_code(asn_field)
+        else:
+            asn_display = "-"
         lines.append(
-            f"  {addr}\n"
-            f"    {country} | {asn}\n"
+            f"  {_md_code(addr)}\n"
+            f"    {country} | {asn_display}\n"
             f"    首见 {first}, 最近 {last}"
         )
     if truncated > 0:

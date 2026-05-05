@@ -14,6 +14,7 @@
 ### 变更
 - `_DOH_ENDPOINTS` 由二元组 `(name, url)` 改为三元组 `(name, url, mode)`，`mode` 取 `"json"` 或 `"wire"`，`_query_doh` 按 mode 分派；`_query_doh` 同时新增 `ecs` 可选参数支持 EDNS Client Subnet 注入（仅 JSON 模式生效）。
 - 已知不兼容端点 Quad9 从默认列表移除（强制 HTTP/2，aiohttp 默认 HTTP/1.1 不兼容；保留注释说明）。
+- IP 地址、ASN 编号、查询地址等关键字段在所有输出中改用 markdown inline-code (反引号包裹)；AstrBot 的 Telegram adapter 默认走 `telegramify_markdown` + `parse_mode="MarkdownV2"`，所以这些字段在 Telegram 客户端会渲染为等宽块，长按即可复制。其他平台 (QQ / Discord 等) 显示为原始反引号字符，可读性不受影响。
 
 ## [v0.2.3] - 2026-05-04
 
